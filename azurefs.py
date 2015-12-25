@@ -3,6 +3,12 @@
 A FUSE wrapper for locally mounting Azure blob storage
 
 Ahmet Alp Balkan <ahmetalpbalkan at gmail.com>
+Pablo Saavedra <saavedra.pablo@gmail.com>
+
+Assumes AzureFS API 2011-08-18 at least (x-ms-range)
+
+https://msdn.microsoft.com/library/azure/ee691967.aspx
+
 """
 
 import math
@@ -17,8 +23,9 @@ from errno import *
 from os import getuid
 from datetime import datetime
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
-from azure.storage import BlobService, WindowsAzureError
-from azure import WindowsAzureMissingResourceError
+from azure.storage.blob import BlobService
+from azure.common import AzureException
+from azure.common import AzureMissingResourceHttpError
 
 
 TIME_FORMAT = '%a, %d %b %Y %H:%M:%S %Z'
@@ -211,12 +218,12 @@ class AzureFS(LoggingMixIn, Operations):
 
             try:
                 data = self.blobs.get_blob(c_name, f_name)
-            except WindowsAzureMissingResourceError:
+            except AzureMissingResourceHttpError:
                 dir = self._get_dir('/' + c_name, True)
                 if f_name in dir['files']:
                     del dir['files'][f_name]
                 raise FuseOSError(ENOENT)
-            except WindowsAzureError as e:
+            except AzureException as e:
                 log.error("Read blob failed HTTP %d" % e.code)
                 raise FuseOSError(EAGAIN)
 
@@ -263,7 +270,7 @@ class AzureFS(LoggingMixIn, Operations):
                         block_ids.append(block_id)
 
                     self.blobs.put_block_list(c_name, f, block_ids)
-            except WindowsAzureError:
+            except AzureException:
                 raise FuseOSError(EAGAIN)
 
             dir = self._get_dir(d, True)
@@ -304,7 +311,7 @@ class AzureFS(LoggingMixIn, Operations):
             if _dir and f in _dir['files']:
                 del _dir['files'][f]
             return 0
-        except WindowsAzureMissingResourceError:
+        except AzureMissingResourceHttpError:
             raise FuseOSError(ENOENT)
         except Exception as e:
             raise FuseOSError(EAGAIN)
@@ -328,8 +335,12 @@ class AzureFS(LoggingMixIn, Operations):
 
         try:
             data = self.blobs.get_blob(c_name, f_name)
+            range_ = "bytes=%s-%s" % (offset, offset+size-1)
+            log.debug("read range: %s" % range_)
+            data = self.blobs.get_blob(c_name, f_name, snapshot=None,
+                                       x_ms_range=range_)
             self.fds[fh] = (self.fds[fh][0], data, False)
-            return data[offset:offset + size]
+            return data
         except URLError, e:
             if e.code == 404:
                 raise FuseOSError(ENOENT)
