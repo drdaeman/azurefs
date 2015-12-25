@@ -46,7 +46,6 @@ class AzureFS(LoggingMixIn, Operations):
     blobs = None
     containers = dict()  # <cname, dict(stat:dict,
                                     #files:None|dict<fname, stat>)
-    fds = dict()  # <fd, (path, bytes, dirty)>
     fd = 0
 
     def __init__(self, account, key):
@@ -217,7 +216,7 @@ class AzureFS(LoggingMixIn, Operations):
             f_name = path[path.find('/', 1) + 1:]
 
             try:
-                data = self.blobs.get_blob(c_name, f_name)
+                self.blobs.get_blob_metadata(c_name, f_name)
             except AzureMissingResourceHttpError:
                 dir = self._get_dir('/' + c_name, True)
                 if f_name in dir['files']:
@@ -226,79 +225,22 @@ class AzureFS(LoggingMixIn, Operations):
             except AzureException as e:
                 log.error("Read blob failed HTTP %d" % e.code)
                 raise FuseOSError(EAGAIN)
-
         self.fd += 1
-        self.fds[self.fd] = (path, data, False)
-
         return self.fd
 
-    def flush(self, path, fh=None):
-        if not fh:
-            raise FuseOSError(EIO)
-        else:
-            if fh not in self.fds:
-                raise FuseOSError(EIO)
-            path = self.fds[fh][0]
-            data = self.fds[fh][1]
-            dirty = self.fds[fh][2]
+    # def flush(self, path, fh=None):
+    #     # TODO: Re-conctruct a local memory cache in the next future
 
-            if not dirty:
-                return 0     # avoid redundant write
-
-            d, f = self._parse_path(path)
-            c_name = self.parse_container(path)
-
-            if data is None:
-                data = ''
-
-            try:
-                if len(data) < 64 * 1024 * 1024:   # 64 mb
-                    self.blobs.put_blob(c_name, f, data, 'BlockBlob')
-                else:
-                    # divide file by blocks and upload
-                    block_size = 8 * 1024 * 1024
-                    num_blocks = int(math.ceil(len(data) * 1.0 / block_size))
-                    rd = str(random.randint(1, 1e8))
-                    block_ids = list()
-
-                    for i in range(num_blocks):
-                        part = data[i * block_size:min((i + 1) * block_size,
-                            len(data))]
-                        block_id = base64.encodestring('%s_%s' % (rd,
-                            (8 - len(str(i))) * '0' + str(i)))
-                        self.blobs.put_block(c_name, f, part, block_id)
-                        block_ids.append(block_id)
-
-                    self.blobs.put_block_list(c_name, f, block_ids)
-            except AzureException:
-                raise FuseOSError(EAGAIN)
-
-            dir = self._get_dir(d, True)
-            if not dir or f not in dir['files']:
-                raise FuseOSError(EIO)
-
-            # update local data
-            dir['files'][f]['st_size'] = len(data)
-            dir['files'][f]['st_mtime'] = time.time()
-            self.fds[fh] = (path, data, False)  # mark as not dirty
-            return 0
-
-    def release(self, path, fh=None):
-        if fh is not None and fh in self.fds:
-            del self.fds[fh]
+    # def release(self, path, fh=None):
+    #     # TODO: Re-conctruct a local memory cache in the next future
 
     def truncate(self, path, length, fh=None):
         return 0     # assume done, no need
 
     def write(self, path, data, offset, fh=None):
-        if not fh or fh not in self.fds:
-            raise FuseOSError(ENOENT)
-        else:
-            d = self.fds[fh][1]
-            if d is None:
-                d = ""
-            self.fds[fh] = (self.fds[fh][0], d[:offset] + data, True)
-            return len(data)
+        # TODO: Implement write operation
+        raise FuseOSError(ENOSYS)
+        # return len(data)
 
     def unlink(self, path):
         c_name = self.parse_container(path)
@@ -327,19 +269,14 @@ class AzureFS(LoggingMixIn, Operations):
         return ['.', '..'] + dir['files'].keys()
 
     def read(self, path, size, offset, fh):
-        if not fh or fh not in self.fds:
-            raise FuseOSError(ENOENT)
-
         f_name = path[path.find('/', 1) + 1:]
         c_name = path[1:path.find('/', 1)]
 
         try:
-            data = self.blobs.get_blob(c_name, f_name)
             range_ = "bytes=%s-%s" % (offset, offset+size-1)
             log.debug("read range: %s" % range_)
             data = self.blobs.get_blob(c_name, f_name, snapshot=None,
                                        x_ms_range=range_)
-            self.fds[fh] = (self.fds[fh][0], data, False)
             return data
         except URLError, e:
             if e.code == 404:
@@ -349,44 +286,15 @@ class AzureFS(LoggingMixIn, Operations):
             else:
                 log.error("Read blob failed HTTP %d" % e.code)
                 raise FuseOSError(EAGAIN)
-        data = self.fds[fh][1]
-        if data is None:
-            data = ""
-        return data[offset:offset + size]
 
     def statfs(self, path):
-        return dict(f_bsize=1024, f_blocks=1, f_bavail=maxint)
+        return dict(f_bsize=4096, f_blocks=1, f_bavail=maxint)
 
     def rename(self, old, new):
         """Three stage move operation because Azure do not have
         move or rename call. """
-        od, of = self._parse_path(old)
-
-        if of is None:   # move dir
-            raise FuseOSError(ENOSYS)
-
-        files = self._list_container_blobs(old)
-        if of not in files:
-            raise FuseOSError(ENOENT)
-
-        src = files[of]
-
-        if src['st_mode'] & S_IFREG <= 0:   # move dir
-            raise FuseOSError(ENOSYS)
-
-        fh = self.open(old, 0)
-        data = self.read(old, src['st_size'], 0, fh)
-
-        self.flush(old, fh)
-
-        fh = self.create(new, 0644)
-        if new < 0:
-            raise FuseOSError(EIO)
-        self.write(new, data, 0, fh)
-        res = self.flush(new, fh)
-
-        if res == 0:
-            self.unlink(old)
+        # TODO: Implement rename operation in the next future
+        raise FuseOSError(ENOSYS)
 
     def symlink(self, target, source):
         raise FuseOSError(ENOSYS)
