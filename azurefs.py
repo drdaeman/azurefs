@@ -37,7 +37,7 @@ if __name__ == '__main__':
     log = logging.getLogger()
     ch = logging.StreamHandler()
     log.addHandler(ch)
-    log.setLevel(logging.DEBUG)
+    log.setLevel(logging.INFO)
 
 
 class AzureFS(LoggingMixIn, Operations):
