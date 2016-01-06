@@ -278,7 +278,7 @@ class AzureFS(LoggingMixIn, Operations):
             data = self.blobs.get_blob(c_name, f_name, snapshot=None,
                                        x_ms_range=range_)
             return data
-        except URLError, e:
+        except TypeError, e:
             if e.code == 404:
                 raise FuseOSError(ENOENT)
             elif e.code == 403:
@@ -348,12 +348,12 @@ parser.add_argument('-d', '--debug', action='store_true',
                         help='show debug info')
 
 options = parser.parse_args()
-log.debug("options = %s" % options)
 
 if options.debug:
     log.setLevel(logging.DEBUG)
 else:
     log.setLevel(logging.INFO)
+log.debug("options = %s" % options)
 
 if options.mkdir:
     create_dirs(options.mountpoint)
@@ -368,7 +368,6 @@ mount_options = {
         'max_read':131072,
         'max_write':131072,
         'max_readahead':131072,
-        'direct_io':True
     }
 
 if options.no_allow_other:
@@ -391,15 +390,11 @@ if options.read_only:
 if options.nonempty:
     mount_options['nonempty'] = True
 
+mount_options['nothreads']=False
 
 if __name__ == '__main__':
-    # if len(argv) < 4:
-    #     print('Usage: %s <mount_directory> <account> <secret_key>' % argv[0])
-    #     exit(1)
-    # fuse = FUSE(AzureFS(argv[2], argv[3]), argv[1], debug=False,
-    #         nothreads=False, foreground=True)
-
-    fuse = FUSE(AzureFS(options.account,options.secretkey), **mount_options)
+    log.debug("mount options: %s" % mount_options)
+    fuse = FUSE(AzureFS(options.account,options.secretkey),**mount_options)
 
 
 
