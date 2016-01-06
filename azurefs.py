@@ -16,6 +16,9 @@ import time
 import logging
 import random
 import base64
+import mimetypes
+import grp
+import pwd
 
 from sys import argv, exit, maxint
 from stat import S_IFDIR, S_IFREG
@@ -32,12 +35,6 @@ TIME_FORMAT = '%a, %d %b %Y %H:%M:%S %Z'
 
 if not hasattr(__builtins__, 'bytes'):
     bytes = str
-
-if __name__ == '__main__':
-    log = logging.getLogger()
-    ch = logging.StreamHandler()
-    log.addHandler(ch)
-    log.setLevel(logging.INFO)
 
 
 class AzureFS(LoggingMixIn, Operations):
@@ -238,9 +235,12 @@ class AzureFS(LoggingMixIn, Operations):
         return 0     # assume done, no need
 
     def write(self, path, data, offset, fh=None):
-        # TODO: Implement write operation
-        raise FuseOSError(ENOSYS)
-        # return len(data)
+        # TODO: Re-conctruct a local memory cache in the next future
+        f_name = path[path.find('/', 1) + 1:]
+        c_name = path[1:path.find('/', 1)]
+        file_type = mimetypes.guess_type(f_name)
+        size = len(data)
+        raise FUSEOSError(EPERM)
 
     def unlink(self, path):
         c_name = self.parse_container(path)
@@ -308,10 +308,98 @@ class AzureFS(LoggingMixIn, Operations):
     def chown(self, path, uid, gid):
         pass
 
+import argparse
+
 
 if __name__ == '__main__':
-    if len(argv) < 4:
-        print('Usage: %s <mount_directory> <account> <secret_key>' % argv[0])
-        exit(1)
-    fuse = FUSE(AzureFS(argv[2], argv[3]), argv[1], debug=False,
-            nothreads=False, foreground=True)
+    log = logging.getLogger()
+    ch = logging.StreamHandler()
+    log.addHandler(ch)
+
+
+description = ''
+parser = argparse.ArgumentParser(description=description)
+parser.add_argument('account', metavar='AzureAccount',
+                        help='Azure account')
+parser.add_argument('secretkey', metavar='AzureSecretKey',
+                        help='Azure sercret key')
+parser.add_argument('mountpoint', metavar='LocalPath',
+                        help='the local mount point')
+
+parser.add_argument('--mkdir', action='store_true',
+                        help='create mountpoint if not found (and create intermediate directories as required)')
+parser.add_argument('--nonempty', action='store_true',
+                        help='allows mounts over a non-empty file or directory')
+parser.add_argument('--uid', metavar='N',
+                        help='default UID')
+parser.add_argument('--gid', metavar='N',
+                        help='default GID')
+parser.add_argument('--umask', metavar='MASK',
+                        help='default umask')
+parser.add_argument('--read-only', action='store_true',
+                        help='mount read only')
+
+parser.add_argument('--no-allow-other', action='store_true',
+                        help='Do not allow other users to access mounted directory')
+
+parser.add_argument('-f', '--foreground', action='store_true',
+                        help='run in foreground')
+parser.add_argument('-d', '--debug', action='store_true',
+                        help='show debug info')
+
+options = parser.parse_args()
+log.debug("options = %s" % options)
+
+if options.debug:
+    log.setLevel(logging.DEBUG)
+else:
+    log.setLevel(logging.INFO)
+
+if options.mkdir:
+    create_dirs(options.mountpoint)
+
+mount_options = {
+        'mountpoint':options.mountpoint,
+        'fsname':'azurefs',
+        'foreground':options.foreground,
+        'allow_other':True,
+        'auto_cache':True,
+        'atime':False,
+        'max_read':131072,
+        'max_write':131072,
+        'max_readahead':131072,
+        'direct_io':True
+    }
+
+if options.no_allow_other:
+    mount_options["allow_other"] = False
+if options.uid:
+    try:
+        mount_options['uid'] = pwd.getpwnam(options.uid).pw_uid
+    except Exception, e:
+        mount_options['uid'] = options.uid
+if options.gid:
+    try:
+        mount_options['gid'] = grp.getgrnam(options.gid).gr_gid
+    except:
+        mount_options['gid'] = options.gid
+if options.umask:
+    mount_options['umask'] = options.umask
+if options.read_only:
+    mount_options['ro'] = True
+
+if options.nonempty:
+    mount_options['nonempty'] = True
+
+
+if __name__ == '__main__':
+    # if len(argv) < 4:
+    #     print('Usage: %s <mount_directory> <account> <secret_key>' % argv[0])
+    #     exit(1)
+    # fuse = FUSE(AzureFS(argv[2], argv[3]), argv[1], debug=False,
+    #         nothreads=False, foreground=True)
+
+    fuse = FUSE(AzureFS(options.account,options.secretkey), **mount_options)
+
+
+
