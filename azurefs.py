@@ -37,6 +37,18 @@ if not hasattr(__builtins__, 'bytes'):
     bytes = str
 
 
+def get_blob_list(blob_service, container_name):
+    b = []
+    marker = None
+    while True:
+        log.info("Populating %s: %s" % ( container_name, len(b) ))
+        batch = blob_service.list_blobs(container_name, marker=marker)
+        b.extend(batch)
+        if not batch.next_marker:
+            break
+        marker = batch.next_marker
+    return b
+
 class AzureFS(LoggingMixIn, Operations):
     """Azure Blob Storage filesystem"""
 
@@ -104,7 +116,8 @@ class AzureFS(LoggingMixIn, Operations):
                 # fetch contents of container
                 log.info("------> CONTENTS NOT FOUND: %s" % cname)
 
-                blobs = self.blobs.list_blobs(cname)
+                # blobs = self.blobs.list_blobs(cname)
+                blobs = get_blob_list(self.blobs,cname)
 
                 dirstat = dict(st_mode=(S_IFDIR | 0755), st_size=0,
                                st_uid=getuid(), st_mtime=time.time())
