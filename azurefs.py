@@ -30,6 +30,8 @@ from azure.storage.blob import BlobService
 from azure.common import AzureException
 from azure.common import AzureMissingResourceHttpError
 
+from multiprocessing import Process, Manager
+
 
 TIME_FORMAT = '%a, %d %b %Y %H:%M:%S %Z'
 
@@ -37,17 +39,33 @@ if not hasattr(__builtins__, 'bytes'):
     bytes = str
 
 
-def get_blob_list(blob_service, container_name):
-    b = []
+def convert_to_epoch(date):
+        """Converts Tue, 31 Jul 2012 07:17:34 GMT format to epoch"""
+        return int(time.mktime(time.strptime(date, TIME_FORMAT)))
+
+
+def get_files_from_blob_service(blobs, cname, files):
     marker = None
     while True:
-        log.info("Populating %s: %s" % ( container_name, len(b) ))
-        batch = blob_service.list_blobs(container_name, marker=marker)
-        b.extend(batch)
+        batch = blobs.list_blobs(cname, marker=marker)
+        log.info("Populating %s: %s" % ( cname, len(batch) ))
+
+        for b in batch:
+            blob_name = b.name
+            blob_date = b.properties.last_modified
+            blob_size = long(b.properties.content_length)
+
+            node = dict(st_mode=(S_IFREG | 0644), st_size=blob_size,
+                        st_mtime=convert_to_epoch(blob_date),
+                        st_uid=getuid())
+
+            if blob_name.find('/') == -1:  # file just under container
+                files[blob_name] = node
+
         if not batch.next_marker:
             break
         marker = batch.next_marker
-    return b
+
 
 class AzureFS(LoggingMixIn, Operations):
     """Azure Blob Storage filesystem"""
@@ -61,17 +79,13 @@ class AzureFS(LoggingMixIn, Operations):
         self.blobs = BlobService(account, key)
         self.rebuild_container_list()
 
-    def convert_to_epoch(self, date):
-        """Converts Tue, 31 Jul 2012 07:17:34 GMT format to epoch"""
-        return int(time.mktime(time.strptime(date, TIME_FORMAT)))
-
     def rebuild_container_list(self):
         cmap = dict()
         cnames = set()
         for c in self.blobs.list_containers():
             date = c.properties.last_modified
             cstat = dict(st_mode=(S_IFDIR | 0755), st_uid=getuid(), st_size=0,
-                         st_mtime=self.convert_to_epoch(date))
+                         st_mtime=convert_to_epoch(date))
             cname = c.name
             cmap['/' + cname] = dict(stat=cstat, files=None)
             cnames.add(cname)
@@ -102,9 +116,11 @@ class AzureFS(LoggingMixIn, Operations):
     def _get_dir(self, path, contents_required=False):
         if not self.containers:
             self.rebuild_container_list()
+        if path in self.containers and not contents_required:
+            return self.containers[path]
 
-        if path in self.containers and not (contents_required and \
-                self.containers[path]['files'] is None):
+        if path in self.containers and \
+                self.containers[path]['files'] is not None:
             return self.containers[path]
 
         cname = self.parse_container(path)
@@ -112,31 +128,30 @@ class AzureFS(LoggingMixIn, Operations):
         if '/' + cname not in self.containers:
             raise FuseOSError(ENOENT)
         else:
+            if 'process' in self.containers['/' + cname] and \
+                    self.containers['/' + cname]['process'] is not None:
+                p = self.containers['/' + cname]['process']
+                if not p.is_alive():
+                    p.join()
+                self.containers['/' + cname]['process'] = None
             if self.containers['/' + cname]['files'] is None:
                 # fetch contents of container
                 log.info("------> CONTENTS NOT FOUND: %s" % cname)
 
-                # blobs = self.blobs.list_blobs(cname)
-                blobs = get_blob_list(self.blobs,cname)
-
-                dirstat = dict(st_mode=(S_IFDIR | 0755), st_size=0,
-                               st_uid=getuid(), st_mtime=time.time())
-
                 if self.containers['/' + cname]['files'] is None:
-                    self.containers['/' + cname]['files'] = dict()
-
-                for f in blobs:
-                    blob_name = f.name
-                    blob_date = f.properties.last_modified
-                    blob_size = long(f.properties.content_length)
-
-                    node = dict(st_mode=(S_IFREG | 0644), st_size=blob_size,
-                                st_mtime=self.convert_to_epoch(blob_date),
-                                st_uid=getuid())
-
-                    if blob_name.find('/') == -1:  # file just under container
-                        self.containers['/' + cname]['files'][blob_name] = node
-
+                    m=Manager()
+                    files = m.dict()
+                    p = Process(target=get_files_from_blob_service,
+                            args=(self.blobs, cname, files,))
+                    p.daemon = True  # The process's daemon flag, a Boolean value. This must be
+                    # set before start() is called.
+                    # The initial value is inherited from the creating
+                    # process.
+                    # When a process exits, it attempts to terminate all of
+                    # its daemonic child processes.
+                    p.start()
+                    self.containers['/' + cname]['process'] = p
+                    self.containers['/' + cname]['files'] = files
             return self.containers['/' + cname]
         return None
 
