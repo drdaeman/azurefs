@@ -41,7 +41,7 @@ def get_blob_list(blob_service, container_name):
     b = []
     marker = None
     while True:
-        log.info("Populating %s: %s" % ( container_name, len(b) ))
+        log.info("Populating %s: %s", container_name, len(b))
         batch = blob_service.list_blobs(container_name, marker=marker)
         b.extend(batch)
         if not batch.next_marker:
@@ -100,21 +100,28 @@ class AzureFS(LoggingMixIn, Operations):
         return str(base_container)
 
     def _get_dir(self, path, contents_required=False):
+        log.debug("get_dir: contents_required=%s, has_container=%s, path=%s",
+                  "t" if contents_required else "f",
+                  "t" if path in self.containers else "f",
+                  path)
         if not self.containers:
+            log.info("get_dir: rebuilding container list")
             self.rebuild_container_list()
 
         if path in self.containers and not (contents_required and \
                 self.containers[path]['files'] is None):
+            # log.debug("get_dir: no contents required, returning data for %s", path)
             return self.containers[path]
 
         cname = self.parse_container(path)
 
         if '/' + cname not in self.containers:
+            log.info("get_dir: no such container: /%s", cname)
             raise FuseOSError(ENOENT)
         else:
             if self.containers['/' + cname]['files'] is None:
                 # fetch contents of container
-                log.info("------> CONTENTS NOT FOUND: %s" % cname)
+                log.info("------> CONTENTS NOT FOUND: %s", cname)
 
                 # blobs = self.blobs.list_blobs(cname)
                 blobs = get_blob_list(self.blobs,cname)
@@ -139,12 +146,14 @@ class AzureFS(LoggingMixIn, Operations):
 
                     if blob_name.find('/') == -1:  # file just under container
                         self.containers['/' + cname]['files'][blob_name] = node
+                log.info("------> FETCHED CONTENTS FOR: %s", cname)
 
             return self.containers['/' + cname]
         return None
 
     def _get_file(self, path):
         d, f = self._parse_path(path)
+        log.debug("get_file: requested path=%s (d=%s, f=%s)", path, d, f)
         dir = self._get_dir(d, True)
         files = None
         if dir is not None:
@@ -194,6 +203,7 @@ class AzureFS(LoggingMixIn, Operations):
         return None
 
     def getattr(self, path, fh=None):
+        log.debug("getattr: path=%s", path)
         d, f = self._parse_path(path)
 
         if f is None:
@@ -201,10 +211,10 @@ class AzureFS(LoggingMixIn, Operations):
             return dir['stat']
         else:
             file = self._get_file(path)
-
             if file:
                 return file
 
+        log.warning("getattr: no such file: %s", path)
         raise FuseOSError(ENOENT)
 
     # FUSE
@@ -216,12 +226,10 @@ class AzureFS(LoggingMixIn, Operations):
                 log.error("Container names can be 3 through 63 chars long.")
                 raise FuseOSError(ENAMETOOLONG)
             if name is not name.lower():
-                log.error("Container names cannot contain uppercase \
-                        characters.")
+                log.error("Container names cannot contain uppercase characters.")
                 raise FuseOSError(EACCES)
             if name.count('--') > 0:
-                log.error('Container names cannot contain consecutive \
-                        dashes (-).')
+                log.error('Container names cannot contain consecutive dashes (-).')
                 raise FuseOSError(EAGAIN)
             #TODO handle all "-"s must be preceded by letter or numbers
             #TODO starts with only letter or number, can contain letter, nr,'-'
@@ -230,11 +238,10 @@ class AzureFS(LoggingMixIn, Operations):
 
             if resp:
                 self.rebuild_container_list()
-                log.info("CONTAINER %s CREATED" % name)
+                log.info("CONTAINER %s CREATED", name)
             else:
+                log.error("Invalid container name or container already exists.")
                 raise FuseOSError(EACCES)
-                log.error("Invalid container name or container already \
-                        exists.")
         else:
             raise FuseOSError(ENOSYS)  # TODO support 2nd+ level mkdirs
 
@@ -268,6 +275,7 @@ class AzureFS(LoggingMixIn, Operations):
         return self.open(path, data='')     # reusing handler provider
 
     def open(self, path, flags=0, data=None):
+        log.info("open: path=%s; flags=%s", path, flags)
         if data == None:                    # download contents
             c_name = self.parse_container(path)
             f_name = path[path.find('/', 1) + 1:]
@@ -278,9 +286,10 @@ class AzureFS(LoggingMixIn, Operations):
                 dir = self._get_dir('/' + c_name, True)
                 if f_name in dir['files']:
                     del dir['files'][f_name]
+                log.info("open: remote says there is no such file: c=%s f=%s", c_name, f_name)
                 raise FuseOSError(ENOENT)
             except AzureException as e:
-                log.error("Read blob failed HTTP %d" % e.code)
+                log.error("Read blob failed HTTP %d", e.code)
                 raise FuseOSError(EAGAIN)
         self.fd += 1
         return self.fd
@@ -325,6 +334,7 @@ class AzureFS(LoggingMixIn, Operations):
 
         dir = self._get_dir(path, True)
         if not dir:
+            log.info("readdir: no such file: %s", path)
             raise FuseOSError(ENOENT)
         return ['.', '..'] + dir['files'].keys()
 
@@ -334,7 +344,7 @@ class AzureFS(LoggingMixIn, Operations):
 
         try:
             range_ = "bytes=%s-%s" % (offset, offset+size-1)
-            log.debug("read range: %s" % range_)
+            log.debug("read range: %s", range_)
             data = self.blobs.get_blob(c_name, f_name, snapshot=None,
                                        x_ms_range=range_)
             return data
@@ -344,7 +354,7 @@ class AzureFS(LoggingMixIn, Operations):
             elif e.code == 403:
                 raise FUSEOSError(EPERM)
             else:
-                log.error("Read blob failed HTTP %d" % e.code)
+                log.error("Read blob failed HTTP %d", e.code)
                 raise FuseOSError(EAGAIN)
 
     def statfs(self, path):
@@ -372,8 +382,10 @@ import argparse
 
 
 if __name__ == '__main__':
+    fmt = logging.Formatter(fmt="[%(asctime)s] P%(process)d,T%(thread)d %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     log = logging.getLogger()
     ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
     log.addHandler(ch)
 
 
@@ -413,7 +425,7 @@ if options.debug:
     log.setLevel(logging.DEBUG)
 else:
     log.setLevel(logging.INFO)
-log.debug("options = %s" % options)
+log.debug("options = %s", options)
 
 if options.mkdir:
     create_dirs(options.mountpoint)
@@ -453,7 +465,7 @@ if options.nonempty:
 mount_options['nothreads']=False
 
 if __name__ == '__main__':
-    log.debug("mount options: %s" % mount_options)
+    log.debug("mount options: %s", mount_options)
     fuse = FUSE(AzureFS(options.account,options.secretkey),**mount_options)
 
 
