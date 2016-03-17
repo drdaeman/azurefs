@@ -133,7 +133,7 @@ class AzureFS(LoggingMixIn, Operations):
         else:
             if self.containers['/' + cname]['files'] is None or force is True:
                 # fetch contents of container
-                log.info("------> CONTENTS NOT FOUND: %s" % cname)
+                log.info("Contents not found in the cache index: %s" % cname)
 
                 if self.containers['/' + cname]['files'] is None:
                     m = Manager()
