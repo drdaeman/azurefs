@@ -152,11 +152,58 @@ class AzureFS(LoggingMixIn, Operations):
             return self.containers['/' + cname]
         return None
 
+
     def _get_file(self, path):
         d, f = self._parse_path(path)
+        log.debug("get_file: requested path=%s (d=%s, f=%s)", path, d, f)
         dir = self._get_dir(d, True)
-        if dir is not None and f in dir['files']:
-            return dir['files'][f]
+        files = None
+        if dir is not None:
+            files = dir['files']
+            if f in files:
+                return files[f]
+
+        if not hasattr(self, "_get_file_noent"):
+            self._get_file_noent = {}
+
+        last_check = self._get_file_noent.get(path, 0)
+        if time.time() - last_check <= 30:   # Negative TTL is 30 seconds (hardcoded for now)
+            log.info("get_file: cache says to reply negative for %s", path)
+            return None
+
+        # Check if file now exists and our caches are just stale.
+        try:
+            c = self.parse_container(d)
+            p = path[path.find('/', 1) + 1:]
+            props = self.blobs.get_blob_properties(c, p)
+            log.info("get_debug: found localy unknown remote file %s: %s", path, repr(props))
+
+            node = dict(st_mode=(S_IFREG | 0644), st_size=long(props.get('content-length', 0)),
+                        st_mtime=self.convert_to_epoch(props['last-modified']),
+                        st_uid=getuid())
+
+            if node['st_size'] > 0:
+                log.info("get_debug: properties for %s: %s", path, repr(node))
+                files[f] = node  # Remember this, so we won't have to re-query it.
+                if path in self._get_file_noent:
+                    del self._get_file_noent[path]
+                return node
+            else:
+                # Sometimes the file is not yet here and is still uploading.
+                # Such files have "content-length: 0". Let's ignore those for now.
+                log.warning("get_file: the file %s is not yet here (size=%s)", path, node['st_size'])
+                self._get_file_noent[path] = time.time()
+                return None
+        except AzureMissingResourceHttpError:
+            log.info("get_file: remote confirms non-existence of %s", path)
+            self._get_file_noent[path] = time.time()
+            return None
+        except AzureException as e:
+            log.error("get_file: exception while querying remote for %s: %s", path, repr(e))
+            self._get_file_noent[path] = time.time()
+
+        return None
+
 
     def getattr(self, path, fh=None):
         d, f = self._parse_path(path)
