@@ -4,97 +4,132 @@ A FUSE wrapper for locally mounting Azure blob storage
 
 Ahmet Alp Balkan <ahmetalpbalkan at gmail.com>
 Pablo Saavedra <saavedra.pablo@gmail.com>
+Aleksey Zhukov <drdaeman@drdaeman.pp.ru>
 
 Assumes AzureFS API 2011-08-18 at least (x-ms-range)
 
 https://msdn.microsoft.com/library/azure/ee691967.aspx
-
 """
 
-import math
-import time
-import logging
-import random
-import base64
-import mimetypes
 import grp
+import logging
 import pwd
+import time
+import os
+import sys
+import errno
+import stat
+import re
 
-from sys import argv, exit, maxint
-from stat import S_IFDIR, S_IFREG
-from errno import *
-from os import getuid
-from datetime import datetime
-from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
+from azure.common import AzureException, AzureHttpError,\
+    AzureMissingResourceHttpError
 from azure.storage.blob import BlobService
-from azure.common import AzureException
-from azure.common import AzureMissingResourceHttpError
+from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
+
+# http://stackoverflow.com/a/23364534/116546
+RE_CONTAINER_NAME = r"^[a-z0-9](?:[a-z0-9]|(\\-(?!\\-))){1,61}[a-z0-9]$"
+RFC822_TIME_FORMAT = '%a, %d %b %Y %H:%M:%S %Z'
 
 
-TIME_FORMAT = '%a, %d %b %Y %H:%M:%S %Z'
+def rfc822_to_epoch(date):
+    """
+    Converts RFC-822/2822 ("Tue, 31 Jul 2012 07:17:34 GMT") string
+    to an integer UNIX timestamp value.
+    """
+    return int(time.mktime(time.strptime(date, RFC822_TIME_FORMAT)))
 
-if not hasattr(__builtins__, 'bytes'):
-    bytes = str
+
+def get_prop(obj, property_name, missing=None):
+    """
+    Tries to get object property, either stored as an attribute,
+    or by treating object as a dict-like one, using getitem.
+
+    This way we can unify querying over BlobProperties and dicts.
+    """
+    attribute_name = property_name.replace("-", "_")
+    if hasattr(obj, attribute_name):
+        return getattr(obj, attribute_name)
+    try:
+        return obj[property_name]
+    except (TypeError, KeyError):
+        return missing
 
 
-def get_blob_list(blob_service, container_name):
-    b = []
-    marker = None
-    while True:
-        log.info("Populating %s: %s", container_name, len(b))
-        batch = blob_service.list_blobs(container_name, marker=marker)
-        b.extend(batch)
-        if not batch.next_marker:
-            break
-        marker = batch.next_marker
-    return b
+def make_stat(mode, props=None):
+    """
+    Given an Properties object, or a dict similar to one fetched
+    by get_blob_properties, return a dict with stat properties.
+    """
+    if props is None:
+        props = dict()
+
+    content_length = get_prop(props, 'content-length', 0)
+    last_modified = get_prop(props, 'last-modified', None)
+    if last_modified:
+        last_modified = rfc822_to_epoch(last_modified)
+    else:
+        last_modified = int(time.time())
+
+    return dict(st_mode=mode,
+                st_uid=os.getuid(),
+                st_size=content_length,
+                st_nlink=1,
+                st_mtime=last_modified)
+
 
 class AzureFS(LoggingMixIn, Operations):
-    """Azure Blob Storage filesystem"""
+    """
+    Azure Blob Storage filesystem
+    """
 
     blobs = None
-    containers = dict()  # <cname, dict(stat:dict,
-                                    #files:None|dict<fname, stat>)
+    containers = dict()  # {cname: {stat:dict, files:None|{fname: stat}}
     fd = 0
 
     def __init__(self, account, key):
         self.blobs = BlobService(account, key)
         self.rebuild_container_list()
 
-    def convert_to_epoch(self, date):
-        """Converts Tue, 31 Jul 2012 07:17:34 GMT format to epoch"""
-        return int(time.mktime(time.strptime(date, TIME_FORMAT)))
+    def _get_blob_list(self, container_name):
+        b = []
+        marker = None
+        while True:
+            log.info("Populating %s: %s", container_name, len(b))
+            batch = self.blobs.list_blobs(container_name, marker=marker)
+            b.extend(batch)
+            if not batch.next_marker:
+                break
+            marker = batch.next_marker
+        return b
 
     def rebuild_container_list(self):
         cmap = dict()
         cnames = set()
+
         for c in self.blobs.list_containers():
-            date = c.properties.last_modified
-            cstat = dict(st_mode=(S_IFDIR | 0755), st_uid=getuid(), st_size=0,
-                         st_mtime=self.convert_to_epoch(date))
+            cstat = make_stat(stat.S_IFDIR | 0755, c.properties)
+
             cname = c.name
             cmap['/' + cname] = dict(stat=cstat, files=None)
             cnames.add(cname)
 
-        cmap['/'] = dict(files={},
-                         stat=dict(st_mode=(S_IFDIR | 0755),
-                                     st_uid=getuid(), st_size=0,
-                                     st_mtime=int(time.time())))
+        cmap['/'] = dict(files={}, stat=make_stat(stat.S_IFDIR | 0755))
+        self.containers = cmap  # destroys fs tree cache resistant to misses
 
-        self.containers = cmap   # destroys fs tree cache resistant to misses
-
-    def _parse_path(self, path):    # returns </dir, file(=None)>
-        if path.count('/') > 1:     # file
+    @staticmethod
+    def _parse_path(path):  # returns </dir, file(=None)>
+        if path.count('/') > 1:  # file
             return str(path[:path.rfind('/')]), str(path[path.rfind('/') + 1:])
-        else:                       # dir
+        else:  # dir
             pos = path.rfind('/', 1)
             if pos == -1:
                 return path, None
             else:
                 return str(path[:pos]), None
 
-    def parse_container(self, path):
-        base_container = path[1:]   # /abc/def/g --> abc
+    @staticmethod
+    def _parse_container(path):
+        base_container = path[1:]  # /abc/def/g --> abc
         if base_container.find('/') > -1:
             base_container = base_container[:base_container.find('/')]
         return str(base_container)
@@ -108,56 +143,51 @@ class AzureFS(LoggingMixIn, Operations):
             log.info("get_dir: rebuilding container list")
             self.rebuild_container_list()
 
-        if path in self.containers and not (contents_required and \
-                self.containers[path]['files'] is None):
-            # log.debug("get_dir: no contents required, returning data for %s", path)
-            return self.containers[path]
+        if path in self.containers:
+            container = self.containers[path]
+            if not (contents_required and container['files'] is None):
+                return container
 
-        cname = self.parse_container(path)
+        cname = self._parse_container(path)
 
         if '/' + cname not in self.containers:
             log.info("get_dir: no such container: /%s", cname)
-            raise FuseOSError(ENOENT)
+            raise FuseOSError(errno.ENOENT)
         else:
             if self.containers['/' + cname]['files'] is None:
                 # fetch contents of container
                 log.info("------> CONTENTS NOT FOUND: %s", cname)
 
                 # blobs = self.blobs.list_blobs(cname)
-                blobs = get_blob_list(self.blobs,cname)
-
-                dirstat = dict(st_mode=(S_IFDIR | 0755), st_size=0,
-                               st_uid=getuid(), st_mtime=time.time())
+                blobs = self._get_blob_list(cname)
 
                 if self.containers['/' + cname]['files'] is None:
                     self.containers['/' + cname]['files'] = dict()
 
                 for f in blobs:
                     blob_name = f.name
-                    blob_date = f.properties.last_modified
                     blob_size = long(f.properties.content_length)
 
                     if blob_size <= 0:
-                        continue  # HACK: Ignore empty files. They're just not yet completely uploaded.
+                        # TODO: FIXME: HACK: We currently ignore empty files.
+                        # They're just not yet completely uploaded.
+                        continue
 
-                    node = dict(st_mode=(S_IFREG | 0644), st_size=blob_size,
-                                st_mtime=self.convert_to_epoch(blob_date),
-                                st_uid=getuid())
-
+                    node = make_stat(stat.S_IFREG | 0644, f.properties)
                     if blob_name.find('/') == -1:  # file just under container
                         self.containers['/' + cname]['files'][blob_name] = node
+
                 log.info("------> FETCHED CONTENTS FOR: %s", cname)
 
             return self.containers['/' + cname]
-        return None
 
     def _get_file(self, path):
         d, f = self._parse_path(path)
         log.debug("get_file: requested path=%s (d=%s, f=%s)", path, d, f)
-        dir = self._get_dir(d, True)
+        directory = self._get_dir(d, True)
         files = None
-        if dir is not None:
-            files = dir['files']
+        if directory is not None:
+            files = directory['files']
             if f in files:
                 return files[f]
 
@@ -165,31 +195,34 @@ class AzureFS(LoggingMixIn, Operations):
             self._get_file_noent = {}
 
         last_check = self._get_file_noent.get(path, 0)
-        if time.time() - last_check <= 30:   # Negative TTL is 30 seconds (hardcoded for now)
+        if time.time() - last_check <= 30:
+            # Negative TTL is 30 seconds (hardcoded for now)
             log.info("get_file: cache says to reply negative for %s", path)
             return None
 
         # Check if file now exists and our caches are just stale.
         try:
-            c = self.parse_container(d)
+            c = self._parse_container(d)
             p = path[path.find('/', 1) + 1:]
             props = self.blobs.get_blob_properties(c, p)
-            log.info("get_file: found locally unknown remote file %s: %s", path, repr(props))
+            log.info("get_file: found locally unknown remote file %s: %s",
+                     path, repr(props))
 
-            node = dict(st_mode=(S_IFREG | 0644), st_size=long(props.get('content-length', 0)),
-                        st_mtime=self.convert_to_epoch(props['last-modified']),
-                        st_uid=getuid())
+            node = make_stat(stat.S_IFREG | 0644, props)
 
             if node['st_size'] > 0:
                 log.info("get_file: properties for %s: %s", path, repr(node))
-                files[f] = node  # Remember this, so we won't have to re-query it.
+                # Remember this, so we won't have to re-query it.
+                files[f] = node
                 if path in self._get_file_noent:
                     del self._get_file_noent[path]
                 return node
             else:
+                # TODO: FIXME: HACK: We currently ignore empty files.
                 # Sometimes the file is not yet here and is still uploading.
-                # Such files have "content-length: 0". Let's ignore those for now.
-                log.warning("get_file: the file %s is not yet here (size=%s)", path, node['st_size'])
+                # Such files have "content-length: 0". Ignore those for now.
+                log.warning("get_file: the file %s is not yet here (size=%s)",
+                            path, node['st_size'])
                 self._get_file_noent[path] = time.time()
                 return None
         except AzureMissingResourceHttpError:
@@ -197,7 +230,8 @@ class AzureFS(LoggingMixIn, Operations):
             self._get_file_noent[path] = time.time()
             return None
         except AzureException as e:
-            log.error("get_file: exception while querying remote for %s: %s", path, repr(e))
+            log.error("get_file: exception while querying remote for %s: %s",
+                      path, repr(e))
             self._get_file_noent[path] = time.time()
 
         return None
@@ -207,43 +241,36 @@ class AzureFS(LoggingMixIn, Operations):
         d, f = self._parse_path(path)
 
         if f is None:
-            dir = self._get_dir(d)
-            return dir['stat']
+            return self._get_dir(d)['stat']
         else:
-            file = self._get_file(path)
-            if file:
-                return file
+            file_obj = self._get_file(path)
+            if file_obj:
+                return file_obj
 
         log.warning("getattr: no such file: %s", path)
-        raise FuseOSError(ENOENT)
+        raise FuseOSError(errno.ENOENT)
 
-    # FUSE
     def mkdir(self, path, mode):
-        if path.count('/') <= 1:    # create on root
+        if path.count('/') <= 1:  # create on root
             name = path[1:]
-
             if not 3 <= len(name) <= 63:
-                log.error("Container names can be 3 through 63 chars long.")
-                raise FuseOSError(ENAMETOOLONG)
-            if name is not name.lower():
-                log.error("Container names cannot contain uppercase characters.")
-                raise FuseOSError(EACCES)
-            if name.count('--') > 0:
-                log.error('Container names cannot contain consecutive dashes (-).')
-                raise FuseOSError(EAGAIN)
-            #TODO handle all "-"s must be preceded by letter or numbers
-            #TODO starts with only letter or number, can contain letter, nr,'-'
+                log.error("Container names can be 3 through 63 chars long")
+                raise FuseOSError(errno.ENAMETOOLONG)
+
+            if not re.match(RE_CONTAINER_NAME, name):
+                log.error("Invalid container name: '%s'", name)
+                raise FuseOSError(errno.EACCES)
 
             resp = self.blobs.create_container(name)
-
             if resp:
                 self.rebuild_container_list()
                 log.info("CONTAINER %s CREATED", name)
             else:
-                log.error("Invalid container name or container already exists.")
-                raise FuseOSError(EACCES)
+                log.error("Invalid container name or container already exists")
+                raise FuseOSError(errno.EACCES)
         else:
-            raise FuseOSError(ENOSYS)  # TODO support 2nd+ level mkdirs
+            # TODO: Support 2nd+ level directory creation
+            raise FuseOSError(errno.ENOSYS)
 
     def rmdir(self, path):
         if path.count('/') == 1:
@@ -254,65 +281,60 @@ class AzureFS(LoggingMixIn, Operations):
                 if path in self.containers:
                     del self.containers[path]
             else:
-                raise FuseOSError(EACCES)
+                raise FuseOSError(errno.EACCES)
         else:
-            raise FuseOSError(ENOSYS)  # TODO support 2nd+ level mkdirs
+            # TODO: Support 2nd+ level directories
+            raise FuseOSError(errno.ENOSYS)
 
-    def create(self, path, mode):
-        node = dict(st_mode=(S_IFREG | mode), st_size=0, st_nlink=1,
-                     st_uid=getuid(), st_mtime=time.time())
+    def create(self, path, mode, fi=None):
+        node = make_stat(stat.S_IFREG | mode)
         d, f = self._parse_path(path)
 
         if not f:
             log.error("Cannot create files on root level: /")
-            raise FuseOSError(ENOSYS)
+            raise FuseOSError(errno.ENOSYS)
 
-        dir = self._get_dir(d, True)
-        if not dir:
-            raise FuseOSError(EIO)
-        dir['files'][f] = node
+        directory = self._get_dir(d, True)
+        if not directory:
+            raise FuseOSError(errno.EIO)
+        directory['files'][f] = node
 
-        return self.open(path, data='')     # reusing handler provider
+        return self.open(path, data='')  # reusing handler provider
 
     def open(self, path, flags=0, data=None):
         log.info("open: path=%s; flags=%s", path, flags)
-        if data == None:                    # download contents
-            c_name = self.parse_container(path)
+        if data is None:
+            # Download contents
+            c_name = self._parse_container(path)
             f_name = path[path.find('/', 1) + 1:]
 
             try:
                 self.blobs.get_blob_metadata(c_name, f_name)
             except AzureMissingResourceHttpError:
-                dir = self._get_dir('/' + c_name, True)
-                if f_name in dir['files']:
-                    del dir['files'][f_name]
-                log.info("open: remote says there is no such file: c=%s f=%s", c_name, f_name)
-                raise FuseOSError(ENOENT)
+                directory = self._get_dir('/' + c_name, True)
+                if f_name in directory['files']:
+                    del directory['files'][f_name]
+                log.info("open: remote says there is no such file: c=%s f=%s",
+                         c_name, f_name)
+                raise FuseOSError(errno.ENOENT)
+            except AzureHttpError as e:
+                log.error("Read blob failed with HTTP %d", e.status_code)
+                raise FuseOSError(errno.EAGAIN)
             except AzureException as e:
-                log.error("Read blob failed HTTP %d", e.code)
-                raise FuseOSError(EAGAIN)
+                log.exception("Read blob failed with exception: %s", repr(e))
+                raise FuseOSError(errno.EAGAIN)
         self.fd += 1
         return self.fd
 
-    # def flush(self, path, fh=None):
-    #     # TODO: Re-conctruct a local memory cache in the next future
-
-    # def release(self, path, fh=None):
-    #     # TODO: Re-conctruct a local memory cache in the next future
-
     def truncate(self, path, length, fh=None):
-        return 0     # assume done, no need
+        return 0  # assume done, no need
 
     def write(self, path, data, offset, fh=None):
-        # TODO: Re-conctruct a local memory cache in the next future
-        f_name = path[path.find('/', 1) + 1:]
-        c_name = path[1:path.find('/', 1)]
-        file_type = mimetypes.guess_type(f_name)
-        size = len(data)
-        raise FUSEOSError(EPERM)
+        # TODO: Re-implement writing
+        raise FuseOSError(errno.EPERM)
 
     def unlink(self, path):
-        c_name = self.parse_container(path)
+        c_name = self._parse_container(path)
         d, f = self._parse_path(path)
 
         try:
@@ -323,51 +345,49 @@ class AzureFS(LoggingMixIn, Operations):
                 del _dir['files'][f]
             return 0
         except AzureMissingResourceHttpError:
-            raise FuseOSError(ENOENT)
-        except Exception as e:
-            raise FuseOSError(EAGAIN)
+            raise FuseOSError(errno.ENOENT)
+        except:
+            raise FuseOSError(errno.EAGAIN)
 
     def readdir(self, path, fh):
         if path == '/':
-            return ['.', '..'] + [x[1:] for x in self.containers.keys() \
-                    if x is not '/']
+            return ['.', '..'] + [x[1:] for x in self.containers.keys()
+                                  if x != '/']
 
-        dir = self._get_dir(path, True)
-        if not dir:
+        directory = self._get_dir(path, True)
+        if not directory:
             log.info("readdir: no such file: %s", path)
-            raise FuseOSError(ENOENT)
-        return ['.', '..'] + dir['files'].keys()
+            raise FuseOSError(errno.ENOENT)
+        return ['.', '..'] + directory['files'].keys()
 
     def read(self, path, size, offset, fh):
         f_name = path[path.find('/', 1) + 1:]
         c_name = path[1:path.find('/', 1)]
 
         try:
-            range_ = "bytes=%s-%s" % (offset, offset+size-1)
-            log.debug("read range: %s", range_)
+            byte_range = "bytes=%s-%s" % (offset, offset + size - 1)
+            log.debug("read range: %s", byte_range)
             data = self.blobs.get_blob(c_name, f_name, snapshot=None,
-                                       x_ms_range=range_)
+                                       x_ms_range=byte_range)
             return data
-        except TypeError, e:
-            if e.code == 404:
-                raise FuseOSError(ENOENT)
-            elif e.code == 403:
-                raise FUSEOSError(EPERM)
+        except AzureHttpError as e:
+            if e.status_code == 404:
+                raise FuseOSError(errno.ENOENT)
+            elif e.status_code == 403:
+                raise FuseOSError(errno.EPERM)
             else:
-                log.error("Read blob failed HTTP %d", e.code)
-                raise FuseOSError(EAGAIN)
+                log.error("Read blob failed with HTTP %d", e.status_code)
+                raise FuseOSError(errno.EAGAIN)
 
     def statfs(self, path):
-        return dict(f_bsize=4096, f_blocks=1, f_bavail=maxint)
+        return dict(f_bsize=4096, f_blocks=1, f_bavail=sys.maxint)
 
     def rename(self, old, new):
-        """Three stage move operation because Azure do not have
-        move or rename call. """
-        # TODO: Implement rename operation in the next future
-        raise FuseOSError(ENOSYS)
+        # TODO: Implement renaming
+        raise FuseOSError(errno.ENOSYS)
 
     def symlink(self, target, source):
-        raise FuseOSError(ENOSYS)
+        raise FuseOSError(errno.ENOSYS)
 
     def getxattr(self, path, name, position=0):
         return ''
@@ -378,95 +398,93 @@ class AzureFS(LoggingMixIn, Operations):
     def chown(self, path, uid, gid):
         pass
 
-import argparse
-
 
 if __name__ == '__main__':
-    fmt = logging.Formatter(fmt="[%(asctime)s] P%(process)d,T%(thread)d %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    import argparse
+
+    # Command-line argument parsing
+    description = ''
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('account', metavar='AzureAccount',
+                        help='Azure account')
+    parser.add_argument('secretkey', metavar='AzureSecretKey',
+                        help='Azure secret key')
+    parser.add_argument('mountpoint', metavar='LocalPath',
+                        help='the local mount point')
+
+    parser.add_argument('--mkdir', action='store_true',
+                        help='create mountpoint if not found (and create'
+                             ' intermediate directories as required)')
+    parser.add_argument('--nonempty', action='store_true',
+                        help='allows mounts over a non-empty file'
+                             ' or directory')
+    parser.add_argument('--uid', metavar='N',
+                        help='default UID')
+    parser.add_argument('--gid', metavar='N',
+                        help='default GID')
+    parser.add_argument('--umask', metavar='MASK',
+                        help='default umask')
+    parser.add_argument('--read-only', action='store_true',
+                        help='mount read only')
+
+    parser.add_argument('--no-allow-other', action='store_true',
+                        help='Do not allow other users to access'
+                             ' mounted directory')
+
+    parser.add_argument('-f', '--foreground', action='store_true',
+                        help='run in foreground')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='show debug info')
+
+    options = parser.parse_args()
+
+    # Logging setup
+    fmt = logging.Formatter(fmt="[%(asctime)s] P%(process)d,T%(thread)d"
+                                " %(levelname)s: %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
     log = logging.getLogger()
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     log.addHandler(ch)
+    log.setLevel(logging.DEBUG if options.debug else logging.INFO)
+    log.debug("options = %s", options)
 
+    if options.mkdir and not os.path.exists(options.mountpoint):
+        os.makedirs(options.mountpoint)
 
-description = ''
-parser = argparse.ArgumentParser(description=description)
-parser.add_argument('account', metavar='AzureAccount',
-                        help='Azure account')
-parser.add_argument('secretkey', metavar='AzureSecretKey',
-                        help='Azure sercret key')
-parser.add_argument('mountpoint', metavar='LocalPath',
-                        help='the local mount point')
-
-parser.add_argument('--mkdir', action='store_true',
-                        help='create mountpoint if not found (and create intermediate directories as required)')
-parser.add_argument('--nonempty', action='store_true',
-                        help='allows mounts over a non-empty file or directory')
-parser.add_argument('--uid', metavar='N',
-                        help='default UID')
-parser.add_argument('--gid', metavar='N',
-                        help='default GID')
-parser.add_argument('--umask', metavar='MASK',
-                        help='default umask')
-parser.add_argument('--read-only', action='store_true',
-                        help='mount read only')
-
-parser.add_argument('--no-allow-other', action='store_true',
-                        help='Do not allow other users to access mounted directory')
-
-parser.add_argument('-f', '--foreground', action='store_true',
-                        help='run in foreground')
-parser.add_argument('-d', '--debug', action='store_true',
-                        help='show debug info')
-
-options = parser.parse_args()
-
-if options.debug:
-    log.setLevel(logging.DEBUG)
-else:
-    log.setLevel(logging.INFO)
-log.debug("options = %s", options)
-
-if options.mkdir:
-    create_dirs(options.mountpoint)
-
-mount_options = {
-        'mountpoint':options.mountpoint,
-        'fsname':'azurefs',
-        'foreground':options.foreground,
-        'allow_other':True,
-        'auto_cache':True,
-        'atime':False,
-        'max_read':131072,
-        'max_write':131072,
-        'max_readahead':131072,
+    mount_options = {
+        'mountpoint': options.mountpoint,
+        'fsname': 'azurefs',
+        'foreground': options.foreground,
+        'allow_other': True,
+        'auto_cache': True,
+        'atime': False,
+        'max_read': 131072,
+        'max_write': 131072,
+        'max_readahead': 131072,
     }
 
-if options.no_allow_other:
-    mount_options["allow_other"] = False
-if options.uid:
-    try:
-        mount_options['uid'] = pwd.getpwnam(options.uid).pw_uid
-    except Exception, e:
-        mount_options['uid'] = options.uid
-if options.gid:
-    try:
-        mount_options['gid'] = grp.getgrnam(options.gid).gr_gid
-    except:
-        mount_options['gid'] = options.gid
-if options.umask:
-    mount_options['umask'] = options.umask
-if options.read_only:
-    mount_options['ro'] = True
+    if options.no_allow_other:
+        mount_options["allow_other"] = False
+    if options.uid:
+        try:
+            mount_options['uid'] = pwd.getpwnam(options.uid).pw_uid
+        except KeyError:
+            mount_options['uid'] = options.uid
+    if options.gid:
+        try:
+            mount_options['gid'] = grp.getgrnam(options.gid).gr_gid
+        except KeyError:
+            mount_options['gid'] = options.gid
+    if options.umask:
+        mount_options['umask'] = options.umask
+    if options.read_only:
+        mount_options['ro'] = True
 
-if options.nonempty:
-    mount_options['nonempty'] = True
+    if options.nonempty:
+        mount_options['nonempty'] = True
 
-mount_options['nothreads']=False
+    mount_options['nothreads'] = False
 
-if __name__ == '__main__':
     log.debug("mount options: %s", mount_options)
-    fuse = FUSE(AzureFS(options.account,options.secretkey),**mount_options)
-
-
-
+    fuse = FUSE(AzureFS(options.account, options.secretkey), **mount_options)
