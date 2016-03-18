@@ -24,6 +24,7 @@ from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 from azure.storage.blob import BlobService
 from azure.common import AzureException
 from azure.common import AzureMissingResourceHttpError
+from requests.exceptions import ConnectionError
 
 from multiprocessing import Process, Manager
 
@@ -42,25 +43,34 @@ def convert_to_epoch(date):
 def get_files_from_blob_service(blobs, cname, files):
     log.info("Getting files from AzureFS: %s" % cname)
     marker = None
+    available_attempts = 5
     while True:
-        batch = blobs.list_blobs(cname, marker=marker)
-        log.info("Populating %s: %s" % (cname, len(batch)))
+        try:
+            batch = blobs.list_blobs(cname, marker=marker)
+            log.info("Populating %s: %s" % (cname, len(batch)))
 
-        for b in batch:
-            blob_name = b.name
-            blob_date = b.properties.last_modified
-            blob_size = long(b.properties.content_length)
-
-            node = dict(st_mode=(S_IFREG | 0644), st_size=blob_size,
-                        st_mtime=convert_to_epoch(blob_date),
-                        st_uid=getuid())
-
-            if blob_name.find('/') == -1:  # file just under container
-                files[blob_name] = node
-
-        if not batch.next_marker:
-            break
-        marker = batch.next_marker
+            for b in batch:
+                blob_name = b.name
+                blob_date = b.properties.last_modified
+                blob_size = long(b.properties.content_length)
+                node = dict(st_mode=(S_IFREG | 0644), st_size=blob_size,
+                            st_mtime=convert_to_epoch(blob_date),
+                            st_uid=getuid())
+                if blob_name.find('/') == -1:  # file just under container
+                    files[blob_name] = node
+            if not batch.next_marker:
+                break
+            marker = batch.next_marker
+        except Exception as e:
+            log.error("Remote connection error: %s" % e)
+            available_attempts -= 1
+            if available_attempts is 0:
+                log.warning("No more attempts to connect to Azure. Ending the thread")
+                break
+            else:
+                sleep_time = 5
+                log.warning("Trying remote connection again in %s" % sleep_time)
+                time.sleep(sleep_time)
 
 
 class AzureFS(LoggingMixIn, Operations):
@@ -117,7 +127,7 @@ class AzureFS(LoggingMixIn, Operations):
             p = self.containers['/' + cname]['process']
             if not p.is_alive():
                 p.join()
-            self.containers['/' + cname]['process'] = None
+                self.containers['/' + cname]['process'] = None
 
         if not self.containers:
             self.rebuild_container_list()
@@ -132,23 +142,34 @@ class AzureFS(LoggingMixIn, Operations):
         if '/' + cname not in self.containers:
             raise FuseOSError(ENOENT)
         else:
+            try:
+                log.info(">>>> %s - %s " % (cname, self.containers['/' + cname]['process']))
+            except Exception:
+                log.info(">>>> no process: %s " % cname)
             if self.containers['/' + cname]['files'] is None or force is True:
                 # fetch contents of container
                 log.info("Contents not found in the cache index: %s" % cname)
 
-                m = Manager()
-                files = m.dict()
-                p = Process(target=get_files_from_blob_service,
-                            args=(self.blobs, cname, files, ))
-                p.daemon = True  # The process's daemon flag, a Boolean value. This must be
-                # set before start() is called.
-                # The initial value is inherited from the creating
-                # process.
-                # When a process exits, it attempts to terminate all of
-                # its daemonic child processes.
-                p.start()
-                self.containers['/' + cname]['process'] = p
-                self.containers['/' + cname]['files'] = files
+                if 'process' in self.containers['/' + cname] and \
+                        self.containers['/' + cname]['process'] is not None:
+                    pass  # We do nothing. Some thread is still working
+                    # getting files flob blobs
+                    log.info("Launching of a new thread for recovery content for /%s skipped" % cname)
+                else:  # no thread running for this container, so launching a new one
+                    m = Manager()
+                    files = m.dict()
+                    p = Process(target=get_files_from_blob_service,
+                                args=(self.blobs, cname, files, ))
+                    p.daemon = True  # The process's daemon flag, a Boolean value. This must be
+                    # set before start() is called.
+                    # The initial value is inherited from the creating
+                    # process.
+                    # When a process exits, it attempts to terminate all of
+                    # its daemonic child processes.
+                    p.start()
+                    self.containers['/' + cname]['process'] = p
+                    log.info("> S >>> %s - %s " % (cname, self.containers['/' + cname]['process']))
+                    self.containers['/' + cname]['files'] = files
             return self.containers['/' + cname]
         return None
 
@@ -200,6 +221,10 @@ class AzureFS(LoggingMixIn, Operations):
         except AzureException as e:
             log.error("get_file: exception while querying remote for %s: %s", path, repr(e))
             self._get_file_noent[path] = time.time()
+        except ConnectionError as e:
+            log.error("get_file: exception while querying remote for %s: %s", path, repr(e))
+            self._get_file_noent[path] = time.time()
+            return None
 
         return None
 
