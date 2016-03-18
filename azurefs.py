@@ -135,23 +135,21 @@ class AzureFS(LoggingMixIn, Operations):
                 # fetch contents of container
                 log.info("Contents not found in the cache index: %s" % cname)
 
-                if self.containers['/' + cname]['files'] is None:
-                    m = Manager()
-                    files = m.dict()
-                    p = Process(target=get_files_from_blob_service,
-                                args=(self.blobs, cname, files, ))
-                    p.daemon = True  # The process's daemon flag, a Boolean value. This must be
-                    # set before start() is called.
-                    # The initial value is inherited from the creating
-                    # process.
-                    # When a process exits, it attempts to terminate all of
-                    # its daemonic child processes.
-                    p.start()
-                    self.containers['/' + cname]['process'] = p
-                    self.containers['/' + cname]['files'] = files
+                m = Manager()
+                files = m.dict()
+                p = Process(target=get_files_from_blob_service,
+                            args=(self.blobs, cname, files, ))
+                p.daemon = True  # The process's daemon flag, a Boolean value. This must be
+                # set before start() is called.
+                # The initial value is inherited from the creating
+                # process.
+                # When a process exits, it attempts to terminate all of
+                # its daemonic child processes.
+                p.start()
+                self.containers['/' + cname]['process'] = p
+                self.containers['/' + cname]['files'] = files
             return self.containers['/' + cname]
         return None
-
 
     def _get_file(self, path):
         d, f = self._parse_path(path)
@@ -179,7 +177,7 @@ class AzureFS(LoggingMixIn, Operations):
             log.info("get_debug: found localy unknown remote file %s: %s", path, repr(props))
 
             node = dict(st_mode=(S_IFREG | 0644), st_size=long(props.get('content-length', 0)),
-                        st_mtime=self.convert_to_epoch(props['last-modified']),
+                        st_mtime=convert_to_epoch(props['last-modified']),
                         st_uid=getuid())
 
             if node['st_size'] > 0:
@@ -203,7 +201,6 @@ class AzureFS(LoggingMixIn, Operations):
             self._get_file_noent[path] = time.time()
 
         return None
-
 
     def getattr(self, path, fh=None):
         d, f = self._parse_path(path)
