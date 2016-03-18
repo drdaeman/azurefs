@@ -40,6 +40,7 @@ def convert_to_epoch(date):
 
 
 def get_files_from_blob_service(blobs, cname, files):
+    log.info("Getting files from AzureFS: %s" % cname)
     marker = None
     while True:
         batch = blobs.list_blobs(cname, marker=marker)
