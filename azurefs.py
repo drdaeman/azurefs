@@ -26,6 +26,9 @@ from azure.common import AzureException, AzureHttpError,\
 from azure.storage.blob import BlobService
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
+from multiprocessing import Process, Manager
+
+
 # http://stackoverflow.com/a/23364534/116546
 RE_CONTAINER_NAME = r"^[a-z0-9](?:[a-z0-9]|(\\-(?!\\-))){1,61}[a-z0-9]$"
 RFC822_TIME_FORMAT = '%a, %d %b %Y %H:%M:%S %Z'
@@ -77,6 +80,36 @@ def make_stat(mode, props=None):
                 st_mtime=last_modified)
 
 
+def get_files_from_blob_service(blobs, cname, files):
+    log.info("Getting files from AzureFS: %s" % cname)
+    marker = None
+    available_attempts = 5
+    while True:
+        try:
+            batch = blobs.list_blobs(cname, marker=marker)
+            log.info("Populating %s: %s" % (cname, len(batch)))
+
+            for b in batch:
+                blob_name = b.name
+                node = make_stat(stat.S_IFREG | 0644, b.properties)
+                if blob_name.find('/') == -1:  # file just under container
+                    files[blob_name] = node
+            if not batch.next_marker:
+                break
+            marker = batch.next_marker
+        except Exception as e:
+            log.error("Remote connection error: %s" % e)
+            available_attempts -= 1
+            if available_attempts is 0:
+                log.warning("No more attempts to connect to Azure."
+                            " Ending the thread.")
+                break
+            else:
+                sleep_time = 5
+                log.warning("Will retry again in %s seconds" % sleep_time)
+                time.sleep(sleep_time)
+
+
 class AzureFS(LoggingMixIn, Operations):
     """
     Azure Blob Storage filesystem
@@ -88,21 +121,9 @@ class AzureFS(LoggingMixIn, Operations):
 
     def __init__(self, account, key):
         self.blobs = BlobService(account, key)
-        self.rebuild_container_list()
+        self._rebuild_container_list()
 
-    def _get_blob_list(self, container_name):
-        b = []
-        marker = None
-        while True:
-            log.info("Populating %s: %s", container_name, len(b))
-            batch = self.blobs.list_blobs(container_name, marker=marker)
-            b.extend(batch)
-            if not batch.next_marker:
-                break
-            marker = batch.next_marker
-        return b
-
-    def rebuild_container_list(self):
+    def _rebuild_container_list(self):
         cmap = dict()
         cnames = set()
 
@@ -134,52 +155,68 @@ class AzureFS(LoggingMixIn, Operations):
             base_container = base_container[:base_container.find('/')]
         return str(base_container)
 
-    def _get_dir(self, path, contents_required=False):
-        log.debug("get_dir: contents_required=%s, has_container=%s, path=%s",
+    def _get_dir(self, path, contents_required=False, force=False):
+        log.debug("get_dir: contents_required=%s, force=%s,"
+                  " has_container=%s, path=%s",
                   "t" if contents_required else "f",
+                  "t" if force else "f",
                   "t" if path in self.containers else "f",
                   path)
+        cname = self._parse_container(path)
+
+        if 'process' in self.containers['/' + cname] and \
+                self.containers['/' + cname]['process'] is not None:
+            p = self.containers['/' + cname]['process']
+            if not p.is_alive():
+                p.join()
+                self.containers['/' + cname]['process'] = None
+
         if not self.containers:
             log.info("get_dir: rebuilding container list")
-            self.rebuild_container_list()
+            self._rebuild_container_list()
 
         if path in self.containers:
             container = self.containers[path]
-            if not (contents_required and container['files'] is None):
+            if not contents_required:
                 return container
-
-        cname = self._parse_container(path)
+            if not force and container['files'] is not None:
+                return container
 
         if '/' + cname not in self.containers:
             log.info("get_dir: no such container: /%s", cname)
             raise FuseOSError(errno.ENOENT)
         else:
-            if self.containers['/' + cname]['files'] is None:
+            container = self.containers['/' + cname]
+            try:
+                log.info(">>>> %s - %s ",
+                         cname,
+                         container['process'])
+            except KeyError:
+                log.info(">>>> no process: %s " % cname)
+            if container['files'] is None or force is True:
                 # fetch contents of container
-                log.info("------> CONTENTS NOT FOUND: %s", cname)
+                log.info("Contents not found in the cache index: %s", cname)
 
-                # blobs = self.blobs.list_blobs(cname)
-                blobs = self._get_blob_list(cname)
-
-                if self.containers['/' + cname]['files'] is None:
-                    self.containers['/' + cname]['files'] = dict()
-
-                for f in blobs:
-                    blob_name = f.name
-                    blob_size = long(f.properties.content_length)
-
-                    if blob_size <= 0:
-                        # TODO: FIXME: HACK: We currently ignore empty files.
-                        # They're just not yet completely uploaded.
-                        continue
-
-                    node = make_stat(stat.S_IFREG | 0644, f.properties)
-                    if blob_name.find('/') == -1:  # file just under container
-                        self.containers['/' + cname]['files'][blob_name] = node
-
-                log.info("------> FETCHED CONTENTS FOR: %s", cname)
-
-            return self.containers['/' + cname]
+                process = container.get('process', None)
+                if process is not None:
+                    # We do nothing. Some thread is still working,
+                    # getting list of blobs from the container.
+                    log.info("Fetching blob list for '%s' is already"
+                             " handled by %s", cname, process)
+                else:
+                    # No thread running for this container, launch a new one
+                    m = Manager()
+                    files = m.dict()
+                    process = Process(target=get_files_from_blob_service,
+                                      args=(self.blobs, cname, files),
+                                      name="list-blobs/%s" % cname)
+                    process.daemon = True
+                    process.start()
+                    container['process'] = process
+                    log.info("Started blob list retrieval for '%s': %s",
+                             cname, process)
+                    container['files'] = files
+            return container
 
     def _get_file(self, path):
         d, f = self._parse_path(path)
@@ -263,7 +300,7 @@ class AzureFS(LoggingMixIn, Operations):
 
             resp = self.blobs.create_container(name)
             if resp:
-                self.rebuild_container_list()
+                self._rebuild_container_list()
                 log.info("CONTAINER %s CREATED", name)
             else:
                 log.error("Invalid container name or container already exists")
@@ -293,6 +330,11 @@ class AzureFS(LoggingMixIn, Operations):
         if not f:
             log.error("Cannot create files on root level: /")
             raise FuseOSError(errno.ENOSYS)
+
+        if f == ".__refresh_cache__":
+            log.info("Refresh cache forced (%s)" % f)
+            self._get_dir(path, True, True)
+            return self.open(path, data='')
 
         directory = self._get_dir(d, True)
         if not directory:

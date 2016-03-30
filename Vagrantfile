@@ -11,6 +11,7 @@ Vagrant.configure(2) do |config|
      sudo sed -ie 's/^#\s*\(user_allow_other\)/\1/' /etc/fuse.conf
      sudo gpasswd -a vagrant fuse
      [ -e /home/vagrant/mnt ] || mkdir /home/vagrant/mnt
+     sudo chown vagrant /home/vagrant/mnt
      chmod 0750 /home/vagrant/mnt
   SHELL
 end
