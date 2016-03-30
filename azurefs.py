@@ -87,7 +87,8 @@ def get_files_from_blob_service(blobs, cname, files):
     while True:
         try:
             batch = blobs.list_blobs(cname, marker=marker)
-            log.info("Populating %s: %s" % (cname, len(batch)))
+            log.info("Populating %s: received %s blobs, %s total",
+                     cname, len(batch), len(files))
 
             for b in batch:
                 blob_name = b.name
@@ -98,7 +99,7 @@ def get_files_from_blob_service(blobs, cname, files):
                 break
             marker = batch.next_marker
         except Exception as e:
-            log.error("Remote connection error: %s" % e)
+            log.exception("Remote connection error: %s", e)
             available_attempts -= 1
             if available_attempts is 0:
                 log.warning("No more attempts to connect to Azure."
@@ -106,7 +107,7 @@ def get_files_from_blob_service(blobs, cname, files):
                 break
             else:
                 sleep_time = 5
-                log.warning("Will retry again in %s seconds" % sleep_time)
+                log.warning("Will retry again in %s seconds", sleep_time)
                 time.sleep(sleep_time)
 
 
@@ -198,7 +199,7 @@ class AzureFS(LoggingMixIn, Operations):
                 log.info("Contents not found in the cache index: %s", cname)
 
                 process = container.get('process', None)
-                if process is not None:
+                if process is not None and process.is_alive():
                     # We do nothing. Some thread is still working,
                     # getting list of blobs from the container.
                     log.info("Fetching blob list for '%s' is already"
@@ -484,7 +485,7 @@ if __name__ == '__main__':
     fmt = logging.Formatter(fmt="[%(asctime)s] P%(process)d,T%(thread)d"
                                 " %(levelname)s: %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
-    log = logging.getLogger()
+    log = logging.getLogger("azurefs")
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     log.addHandler(ch)
